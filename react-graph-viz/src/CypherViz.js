@@ -5,6 +5,7 @@ import ForceGraph2D from 'react-force-graph-2d';
 import * as d3 from 'd3';
 import migrateTimestamps from './migrateTimestamps';
 import { getNeo4jConfig } from './neo4jConfig';
+import { startNeo4jKeepAlive } from './neo4jKeepAlive';
 import { PHONE_OWNER_KEY, homeUrl, resetUrl } from './appConfig';
 
 const neo4jDb = () => getNeo4jConfig().database;
@@ -983,6 +984,8 @@ class CypherViz extends React.Component {
     
     // Start idle detection
     this.startIdleDetection();
+
+    this.stopKeepAlive = startNeo4jKeepAlive(this.driver);
   }
 
   componentWillUnmount() {
@@ -1021,6 +1024,11 @@ class CypherViz extends React.Component {
     // Remove visibility change listener
     if (this.handleVisibilityChange) {
       document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+
+    if (this.stopKeepAlive) {
+      this.stopKeepAlive();
+      this.stopKeepAlive = null;
     }
   }
 

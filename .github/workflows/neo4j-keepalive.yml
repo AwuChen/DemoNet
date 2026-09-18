@@ -1,0 +1,98 @@
+name: Neo4j Keep-Alive
+
+on:
+  schedule:
+    # Aura Free pauses after ~72 hours idle. GitHub cron can delay, so ping often enough.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/neo4j-keepalive.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: neo4j-keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install neo4j-driver
+        working-directory: react-graph-viz
+        run: npm install neo4j-driver --no-save
+
+      - name: Ping Neo4j Aura
+        working-directory: react-graph-viz
+        env:
+          NEO4J_URI: ${{ secrets.NEO4J_URI }}
+          NEO4J_USER: ${{ secrets.NEO4J_USER }}
+          NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+          NEO4J_DATABASE: ${{ secrets.NEO4J_DATABASE }}
+        run: node scripts/neo4j-keepalive.js
+
+      - name: Export 3D graph snapshot
+        continue-on-error: true
+        working-directory: react-graph-viz
+        env:
+          NEO4J_URI: ${{ secrets.NEO4J_URI }}
+          NEO4J_USER: ${{ secrets.NEO4J_USER }}
+          NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+          NEO4J_DATABASE: ${{ secrets.NEO4J_DATABASE }}
+        run: |
+          if [ ! -f scripts/export-3d-graph.js ]; then
+            echo "export-3d-graph.js not on this branch; skipping snapshot"
+            exit 0
+          fi
+          node scripts/export-3d-graph.js public/graph-data.json
+
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        if: hashFiles('react-graph-viz/public/graph-data.json') != ''
+        with:
+          name: graph-data
+          path: react-graph-viz/public/graph-data.json
+          if-no-files-found: warn
+
+      - name: Record weekly activity so GitHub keeps this schedule enabled
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          stamp=".github/neo4j-keepalive.stamp"
+          mkdir -p .github
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          should_commit=0
+          if [ ! -f "$stamp" ]; then
+            should_commit=1
+          else
+            age_days=$(( ( $(date -u +%s) - $(stat -c %Y "$stamp") ) / 86400 ))
+            if [ "$age_days" -ge 7 ]; then
+              should_commit=1
+            fi
+          fi
+          if [ "$should_commit" -eq 0 ]; then
+            echo "Stamp is recent; skipping commit"
+            exit 0
+          fi
+          printf 'lastPing=%s\n' "$now" > "$stamp"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$stamp"
+          if git diff --cached --quiet; then
+            echo "No stamp change"
+            exit 0
+          fi
+          git commit -m "Keep Neo4j keep-alive schedule active."
+          git stash push -u -m "ci-temp" || true
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
