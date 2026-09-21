@@ -1068,7 +1068,7 @@ class CypherViz extends React.Component {
                        card.website = '',
                        card.createdAt = $timestamp
 
-         MERGE (owner)-[r:CONNECTED_TO]->(card) 
+         MERGE (card)-[r:CONNECTED_TO]->(owner) 
          ON CREATE SET r.createdAt = $timestamp
         `,
         { 
@@ -1078,7 +1078,7 @@ class CypherViz extends React.Component {
         }
       );
       
-      console.log(`NFC: Connected ${capitalizedPhoneOwner} -> ${capitalizedCardUser} at ${timestamp}`);
+      console.log(`NFC: Connected ${capitalizedCardUser} -> ${capitalizedPhoneOwner} at ${timestamp}`);
       
       // Store the card user node for focusing after reload
       this.pendingNFCNode = capitalizedCardUser;
