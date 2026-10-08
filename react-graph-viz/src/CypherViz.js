@@ -1700,13 +1700,13 @@ const NFCTrigger = ({ addNode, registerAndConnect, ensureOwner }) => {
             />
           </label>
           <label style={{ display: "block", marginBottom: "16px" }}>
-            <span style={{ fontWeight: 600 }}>LinkedIn URL</span>
+            <span style={{ fontWeight: 600 }}>Website</span>
             <input
               name="website"
               type="url"
               value={profileForm.website}
               onChange={handleProfileChange}
-              placeholder="https://linkedin.com/in/..."
+              placeholder="https://yoursite.com or portfolio URL"
               style={{ display: "block", width: "100%", marginTop: "4px", padding: "10px", fontSize: "16px", boxSizing: "border-box" }}
             />
           </label>
@@ -1863,6 +1863,24 @@ const ResetPhone = () => {
         const [autoZoomTriggered, setAutoZoomTriggered] = useState(false); // Track if auto-zoom has been triggered
         const [timelinePlaying, setTimelinePlaying] = useState(false);
         const graphData = timelineMode && timelineData ? timelineData : data;
+        // Force-graph can keep drawing removed nodes unless we remount when the visible set changes.
+        const forceGraphKey = (() => {
+          if (!timelineMode) return 'live';
+          if (!timelineData) return 'timeline-empty';
+          const nodeKey = timelineData.nodes
+            .map((n) => n.name)
+            .sort()
+            .join('\0');
+          const linkKey = timelineData.links
+            .map((l) => {
+              const s = typeof l.source === 'object' ? l.source.name : l.source;
+              const t = typeof l.target === 'object' ? l.target.name : l.target;
+              return `${s}\0${t}`;
+            })
+            .sort()
+            .join('\0');
+          return `timeline-${nodeKey}::${linkKey}`;
+        })();
 
         useEffect(() => {
           if (!timelineMode) {
@@ -3047,7 +3065,7 @@ ${topConnectors.slice(0, 5).map((connector, index) =>
 - **Role**: ${nodeInfo.role || 'N/A'}
 - **School**: ${nodeInfo.school || 'N/A'}
 - **Email**: ${nodeInfo.email || 'N/A'}
-- **LinkedIn**: ${nodeInfo.website || 'N/A'}
+- **Website**: ${nodeInfo.website || 'N/A'}
 - **Total Connections**: ${totalConnections}
 
 ## **🔗 Connection Analysis**
@@ -3485,6 +3503,7 @@ return (
   {mainView === 'graph' && (
   <>
   <ForceGraph2D
+  key={forceGraphKey}
   ref={fgRef}
   graphData={graphData}
   warmupTicks={timelineMode ? 0 : undefined}
@@ -3662,7 +3681,7 @@ return (
                 </a>
               </p>}
               {selectedNode?.website && (
-                <p><strong>LinkedIn:</strong>{" "}
+                <p><strong>Website:</strong>{" "}
                   <a
                     href={normalizeUrl(selectedNode.website)}
                     target="_blank"

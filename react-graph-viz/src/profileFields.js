@@ -10,10 +10,10 @@ export function normalizeUrl(raw) {
   return url;
 }
 
-/** Extra URLs from import (pipe-separated), excluding LinkedIn already shown separately. */
-export function parseExtraLinks(linksField, linkedInUrl) {
+/** Extra URLs from import (pipe-separated), excluding primary website already shown separately. */
+export function parseExtraLinks(linksField, primaryWebsiteUrl) {
   if (!linksField) return [];
-  const linked = normalizeUrl(linkedInUrl);
+  const linked = normalizeUrl(primaryWebsiteUrl);
   const seen = new Set(linked ? [linked.toLowerCase()] : []);
   const out = [];
   for (const part of String(linksField).split('|')) {

@@ -10,7 +10,7 @@ Live site: [https://awuchen.github.io/DemoNet](https://awuchen.github.io/DemoNet
 
 - NFC / URL card tap with onboarding: claim your card or register as someone else, then connect
 - `CONNECTED_TO` relationships with `createdAt` for timeline playback
-- Force-directed graph; profiles use **school**, **role**, **email**, **LinkedIn**, and extra **links**
+- Force-directed graph; profiles use **school**, **role**, **email**, **website**, and extra **links**
 - **Connections** view (default when a phone owner is set): people you met plus follow-up suggestions
 - **Timeline** mode: client-side playback with pinned layout (no force-layout springing or playback flicker)
 - Natural-language search and optional research export CSV (`scripts/export_participant_connections.py`)
