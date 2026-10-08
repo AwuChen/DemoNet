@@ -1,14 +1,14 @@
 {
   "files": {
     "main.css": "/DemoNet/static/css/main.ead59979.chunk.css",
-    "main.js": "/DemoNet/static/js/main.6c6a84d0.chunk.js",
-    "main.js.map": "/DemoNet/static/js/main.6c6a84d0.chunk.js.map",
+    "main.js": "/DemoNet/static/js/main.c4131787.chunk.js",
+    "main.js.map": "/DemoNet/static/js/main.c4131787.chunk.js.map",
     "runtime-main.js": "/DemoNet/static/js/runtime-main.fff16487.js",
     "runtime-main.js.map": "/DemoNet/static/js/runtime-main.fff16487.js.map",
     "static/js/2.80928e4f.chunk.js": "/DemoNet/static/js/2.80928e4f.chunk.js",
     "static/js/2.80928e4f.chunk.js.map": "/DemoNet/static/js/2.80928e4f.chunk.js.map",
     "index.html": "/DemoNet/index.html",
-    "precache-manifest.d8882d1935edff33ae142a7eb764cf42.js": "/DemoNet/precache-manifest.d8882d1935edff33ae142a7eb764cf42.js",
+    "precache-manifest.ccd5412641f9b18e23c6d83381412408.js": "/DemoNet/precache-manifest.ccd5412641f9b18e23c6d83381412408.js",
     "service-worker.js": "/DemoNet/service-worker.js",
     "static/css/main.ead59979.chunk.css.map": "/DemoNet/static/css/main.ead59979.chunk.css.map",
     "static/js/2.80928e4f.chunk.js.LICENSE.txt": "/DemoNet/static/js/2.80928e4f.chunk.js.LICENSE.txt"
@@ -17,6 +17,6 @@
     "static/js/runtime-main.fff16487.js",
     "static/js/2.80928e4f.chunk.js",
     "static/css/main.ead59979.chunk.css",
-    "static/js/main.6c6a84d0.chunk.js"
+    "static/js/main.c4131787.chunk.js"
   ]
 }
