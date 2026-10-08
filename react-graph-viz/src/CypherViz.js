@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { HashRouter as Router, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import './App.css';
 import ForceGraph2D from 'react-force-graph-2d';
@@ -7,8 +7,27 @@ import migrateTimestamps from './migrateTimestamps';
 import { getNeo4jConfig } from './neo4jConfig';
 import { startNeo4jKeepAlive } from './neo4jKeepAlive';
 import { PHONE_OWNER_KEY, homeUrl, resetUrl } from './appConfig';
+import {
+  parseExtraLinks,
+  linkLabel,
+  normalizeUrl,
+  profileFromRecord,
+  profileFromNeo4jProps,
+  recordField,
+} from './profileFields';
+import ParticipantInsightsPanel from './ParticipantInsightsPanel';
+import { loadParticipantNetworkInsights } from './participantNetwork';
+import { fetchTimelineEvents, buildTimelineGraphAtStable } from './timelinePlayback';
 
 const neo4jDb = () => getNeo4jConfig().database;
+
+function capitalizeDisplayName(str) {
+  if (!str) return str;
+  return str
+    .split(' ')
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(' ');
+}
 
 class CypherViz extends React.Component {
   constructor({ driver }) {
@@ -24,8 +43,8 @@ class CypherViz extends React.Component {
     this.state = {
       data: this.defaultData,
       query: `MATCH (u:User)-[r:CONNECTED_TO]->(v:User) 
-          RETURN u.name AS source, u.role AS sourceRole, u.location AS sourceLocation, u.website AS sourceWebsite, u.email AS sourceEmail,
-      v.name AS target, v.role AS targetRole, v.location AS targetLocation, v.website AS targetWebsite, v.email AS targetEmail`,
+          RETURN u.name AS source, u.role AS sourceRole, u.school AS sourceSchool, u.website AS sourceWebsite, u.email AS sourceEmail, u.links AS sourceLinks,
+      v.name AS target, v.role AS targetRole, v.school AS targetSchool, v.website AS targetWebsite, v.email AS targetEmail, v.links AS targetLinks`,
       latestNode: null, // For NFC editing
       pollingFocusNode: null, // For polling focus (non-editable)
       lastUpdateTime: null,
@@ -44,8 +63,8 @@ class CypherViz extends React.Component {
 
     // Store the default query for polling (separate from user input)
     this.defaultQuery = `MATCH (u:User)-[r:CONNECTED_TO]->(v:User) 
-        RETURN u.name AS source, u.role AS sourceRole, u.location AS sourceLocation, u.website AS sourceWebsite, u.email AS sourceEmail,
-        v.name AS target, v.role AS targetRole, v.location AS targetLocation, v.website AS targetWebsite, v.email AS targetEmail`;
+        RETURN u.name AS source, u.role AS sourceRole, u.school AS sourceSchool, u.website AS sourceWebsite, u.email AS sourceEmail, u.links AS sourceLinks,
+        v.name AS target, v.role AS targetRole, v.school AS targetSchool, v.website AS targetWebsite, v.email AS targetEmail, v.links AS targetLinks`;
 
     // Store the last known data hash for change detection
     this.lastDataHash = null;
@@ -67,6 +86,9 @@ class CypherViz extends React.Component {
     this.breathingInterval = null; // Interval for breathing cycle
     this.scaleTransitionStart = null; // For smooth scaling transition
     this.scaleTransitionDuration = 1000; // 1 second transition
+    this.timelineEvents = null;
+    this.timelineLayoutCache = new Map();
+    this.timelineNodeMap = new Map();
 
   }
 
@@ -560,10 +582,7 @@ class CypherViz extends React.Component {
         if (!nodesMap.has(source)) {
           nodesMap.set(source, {
             name: source,
-            role: record.get("sourceRole"),
-            location: record.get("sourceLocation"),
-            website: record.get("sourceWebsite"),
-            email: record.get("sourceEmail"),
+            ...profileFromRecord(record, 'source'),
             x: Math.random() * 500,
             y: Math.random() * 500,
           });
@@ -572,10 +591,7 @@ class CypherViz extends React.Component {
         if (!nodesMap.has(target)) {
           nodesMap.set(target, {
             name: target,
-            role: record.get("targetRole"),
-            location: record.get("targetLocation"),
-            website: record.get("targetWebsite"),
-            email: record.get("targetEmail"),
+            ...profileFromRecord(record, 'target'),
             x: Math.random() * 500,
             y: Math.random() * 500,
           });
@@ -595,10 +611,7 @@ class CypherViz extends React.Component {
             if (!nodesMap.has(name)) {
               nodesMap.set(name, {
                 name,
-                role: node.properties.role || "",
-                location: node.properties.location || "",
-                website: node.properties.website || "",
-                email: node.properties.email || "",
+                ...profileFromNeo4jProps(node.properties),
                 x: Math.random() * 500,
                 y: Math.random() * 500,
               });
@@ -609,10 +622,14 @@ class CypherViz extends React.Component {
             if (!nodesMap.has(name)) {
               nodesMap.set(name, {
                 name,
-                role: node.role || node.u_role || "",
-                location: node.location || node.u_location || "",
-                website: node.website || node.u_website || "",
-                email: node.email || node.u_email || "",
+                ...profileFromNeo4jProps({
+                  role: node.role || node.u_role,
+                  school: node.school || node.u_school,
+                  location: node.location || node.u_location,
+                  website: node.website || node.u_website,
+                  email: node.email || node.u_email,
+                  links: node.links || node.u_links,
+                }),
                 x: Math.random() * 500,
                 y: Math.random() * 500,
               });
@@ -623,10 +640,13 @@ class CypherViz extends React.Component {
             if (!nodesMap.has(name)) {
               nodesMap.set(name, {
                 name,
-                role: record.get(key.replace('name', 'role')) || "",
-                location: record.get(key.replace('name', 'location')) || "",
-                website: record.get(key.replace('name', 'website')) || "",
-                email: record.get(key.replace('name', 'email')) || "",
+                role: recordField(record, key.replace('name', 'role')),
+                school:
+                  recordField(record, key.replace('name', 'school')) ||
+                  recordField(record, key.replace('name', 'location')),
+                website: recordField(record, key.replace('name', 'website')),
+                email: recordField(record, key.replace('name', 'email')),
+                links: recordField(record, key.replace('name', 'links')),
                 x: Math.random() * 500,
                 y: Math.random() * 500,
               });
@@ -808,7 +828,7 @@ class CypherViz extends React.Component {
   // Calculate a simple hash of the graph data for change detection
   calculateDataHash = (data) => {
     // Only hash the actual data, not the random coordinates
-    const nodesStr = data.nodes.map(n => `${n.name}:${n.role}:${n.location}:${n.website}`).sort().join('|');
+    const nodesStr = data.nodes.map(n => `${n.name}:${n.role}:${n.school}:${n.website}:${n.links}`).sort().join('|');
     const linksStr = data.links.map(l => {
       const source = typeof l.source === 'object' ? l.source.name : l.source;
       const target = typeof l.target === 'object' ? l.target.name : l.target;
@@ -838,9 +858,10 @@ class CypherViz extends React.Component {
         // New node added
         changedNodes.push(newNode.name);
         hasChanges = true;
-      } else if (oldNode.role !== newNode.role || 
-                 oldNode.location !== newNode.location || 
-                 oldNode.website !== newNode.website) {
+      } else if (oldNode.role !== newNode.role ||
+                 oldNode.school !== newNode.school ||
+                 oldNode.website !== newNode.website ||
+                 oldNode.links !== newNode.links) {
         // Existing node modified
         changedNodes.push(newNode.name);
         hasChanges = true;
@@ -884,7 +905,12 @@ class CypherViz extends React.Component {
       // Only poll if the tab is active (to save resources)
       if (!document.hidden) {
         // Use default query for polling, but respect custom query state, mutation processing, and NFC operations
-        if (this.state.customQueryActive || this.state.processingMutation || this.isNFCOperation) {
+        if (
+          this.state.timelineMode ||
+          this.state.customQueryActive ||
+          this.state.processingMutation ||
+          this.isNFCOperation
+        ) {
           return;
         }
         // Don't preserve latestNode during polling - let change detection determine focus
@@ -1032,20 +1058,18 @@ class CypherViz extends React.Component {
     }
   }
 
-  addNodeNFC = async (cardUser, phoneOwner) => {
-    // Helper function to capitalize first letter of each word
-    const capitalizeWords = (str) => {
-      if (!str) return str;
-      return str.split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()).join(' ');
-    };
+  connectNFC = async (cardUser, phoneOwner, ownerProfile = {}) => {
+    const capitalizedCardUser = capitalizeDisplayName(cardUser);
+    const capitalizedPhoneOwner = capitalizeDisplayName(phoneOwner);
 
-    const capitalizedCardUser = capitalizeWords(cardUser);
-    const capitalizedPhoneOwner = capitalizeWords(phoneOwner);
+    const role = (ownerProfile.role || '').trim();
+    const school = (ownerProfile.school || '').trim();
+    const email = (ownerProfile.email || '').trim();
+    const website = (ownerProfile.website || '').trim();
+    const links = (ownerProfile.links || '').trim();
 
-    // Set NFC operation flag to prevent double reload
     this.isNFCOperation = true;
 
-    // Clear any existing pending NFC node to prevent conflicts
     if (this.pendingNFCNode) {
       this.pendingNFCNode = null;
     }
@@ -1054,18 +1078,26 @@ class CypherViz extends React.Component {
     try {
       const timestamp = Date.now();
 
-      // Merge both user nodes and create the connection
       await session.run(
         `MERGE (owner:User {name: $phoneOwner}) 
-         ON CREATE SET owner.role = '', 
-                       owner.location = '', 
-                       owner.website = '',
+         ON CREATE SET owner.role = $role, 
+                       owner.school = $school, 
+                       owner.email = $email,
+                       owner.website = $website,
+                       owner.links = $links,
                        owner.createdAt = $timestamp
+         ON MATCH SET owner.role = CASE WHEN $role <> '' THEN $role ELSE owner.role END,
+                       owner.school = CASE WHEN $school <> '' THEN $school ELSE owner.school END,
+                       owner.email = CASE WHEN $email <> '' THEN $email ELSE owner.email END,
+                       owner.website = CASE WHEN $website <> '' THEN $website ELSE owner.website END,
+                       owner.links = CASE WHEN $links <> '' THEN $links ELSE owner.links END
 
          MERGE (card:User {name: $cardUser}) 
          ON CREATE SET card.role = '', 
-                       card.location = '', 
+                       card.school = '', 
+                       card.email = '',
                        card.website = '',
+                       card.links = '',
                        card.createdAt = $timestamp
 
          MERGE (card)-[r:CONNECTED_TO]->(owner) 
@@ -1074,16 +1106,19 @@ class CypherViz extends React.Component {
         { 
           phoneOwner: capitalizedPhoneOwner, 
           cardUser: capitalizedCardUser,
+          role,
+          school,
+          email,
+          website,
+          links,
           timestamp: timestamp
         }
       );
       
       console.log(`NFC: Connected ${capitalizedCardUser} -> ${capitalizedPhoneOwner} at ${timestamp}`);
       
-      // Store the card user node for focusing after reload
       this.pendingNFCNode = capitalizedCardUser;
       
-      // Reload the graph
       await this.loadData(capitalizedCardUser, this.defaultQuery);
       
       // Wait for the state to update, then focus on the new node
@@ -1115,6 +1150,44 @@ class CypherViz extends React.Component {
     } finally {
       session.close();
     }
+  };
+
+  addNodeNFC = (cardUser, phoneOwner) => this.connectNFC(cardUser, phoneOwner, {});
+
+  registerOwnerAndConnectNFC = (cardUser, profile) =>
+    this.connectNFC(cardUser, profile.name, profile);
+
+  ensurePhoneOwnerNode = async (ownerName, profile = {}) => {
+    const name = capitalizeDisplayName(ownerName);
+    const session = this.driver.session({ database: neo4jDb() });
+    try {
+      await session.run(
+        `MERGE (u:User {name: $name})
+         ON CREATE SET u.role = $role,
+                       u.school = $school,
+                       u.email = $email,
+                       u.website = $website,
+                       u.links = $links,
+                       u.createdAt = $timestamp
+         ON MATCH SET u.role = CASE WHEN $role <> '' THEN $role ELSE u.role END,
+                       u.school = CASE WHEN $school <> '' THEN $school ELSE u.school END,
+                       u.email = CASE WHEN $email <> '' THEN $email ELSE u.email END,
+                       u.website = CASE WHEN $website <> '' THEN $website ELSE u.website END,
+                       u.links = CASE WHEN $links <> '' THEN $links ELSE u.links END`,
+        {
+          name,
+          role: (profile.role || '').trim(),
+          school: (profile.school || '').trim(),
+          email: (profile.email || '').trim(),
+          website: (profile.website || '').trim(),
+          links: (profile.links || '').trim(),
+          timestamp: Date.now(),
+        }
+      );
+    } finally {
+      session.close();
+    }
+    return name;
   };
 
   handleChange = (event) => {
@@ -1172,37 +1245,92 @@ class CypherViz extends React.Component {
     }
   };
 
-  // Timeline methods
+  // Timeline methods (client-side playback; nodes stay pinned — no full re-layout)
+  ensureTimelineEventsLoaded = async () => {
+    if (this.timelineEvents) return this.timelineEvents;
+    if (!this.driver) return null;
+    this.timelineEvents = await fetchTimelineEvents(this.driver, neo4jDb());
+    return this.timelineEvents;
+  };
+
+  applyTimelineTimestamp = (date) => {
+    if (!this.timelineEvents || !date) return;
+    const timelineData = buildTimelineGraphAtStable(
+      this.timelineEvents,
+      date.getTime(),
+      this.timelineLayoutCache,
+      this.timelineNodeMap
+    );
+    const prev = this.state.timelineData;
+    const graphUnchanged =
+      prev &&
+      prev.nodes.length === timelineData.nodes.length &&
+      prev.links.length === timelineData.links.length;
+    if (graphUnchanged) {
+      if (this.state.timelineDate?.getTime() !== date.getTime()) {
+        this.setState({ timelineDate: date });
+      }
+      return;
+    }
+    this.setState({ timelineData, timelineDate: date });
+  };
+
+  stepTimelineForward = (deltaMs = 60000) => {
+    const { timelineDate, timelineStats } = this.state;
+    if (!timelineDate || !timelineStats?.latest) return true;
+    const nextMs = Math.min(
+      timelineDate.getTime() + deltaMs,
+      timelineStats.latest.getTime()
+    );
+    this.applyTimelineTimestamp(new Date(nextMs));
+    return nextMs >= timelineStats.latest.getTime();
+  };
+
   toggleTimelineMode = async () => {
     if (!this.state.timelineMode) {
-      // Entering timeline mode - get timeline stats
       const stats = await this.getTimelineStats();
-      
-      // Stop breathing animation when entering timeline mode
       this.stopBreathingAnimation();
-      
-      // Ensure we have valid stats
+
       const validStats = stats || {
-        earliest: new Date(Date.now() - 86400000), // 24 hours ago
-        latest: new Date()
+        earliest: new Date(Date.now() - 86400000),
+        latest: new Date(),
       };
-      
-      this.setState(prevState => ({
-        timelineMode: true,
-        timelineDate: validStats.latest,
-        timelineData: prevState.data,
-        timelineStats: validStats
-      }));
+
+      try {
+        await this.ensureTimelineEventsLoaded();
+      } catch (error) {
+        console.error('Failed to load timeline events:', error);
+        return;
+      }
+
+      this.timelineLayoutCache.clear();
+      this.timelineNodeMap.clear();
+      (this.state.data?.nodes || []).forEach((n) => {
+        if (n.name != null && n.x != null && n.y != null) {
+          this.timelineLayoutCache.set(n.name, { x: n.x, y: n.y });
+        }
+      });
+
+      this.setState(
+        {
+          timelineMode: true,
+          timelineStats: validStats,
+          timelineDate: validStats.earliest,
+          timelineData: { nodes: [], links: [] },
+        },
+        () => this.applyTimelineTimestamp(validStats.earliest)
+      );
     } else {
-      // Exiting timeline mode
       this.setState({
         timelineMode: false,
         timelineDate: null,
         timelineData: null,
-        timelineStats: null
+        timelineStats: null,
       });
-      
-      // Restart breathing animation if user is idle
+      this.timelineEvents = null;
+      this.timelineLayoutCache.clear();
+      this.timelineNodeMap.clear();
+
       if (!this.state.isUserActive) {
         this.startBreathingAnimation();
       }
@@ -1210,103 +1338,21 @@ class CypherViz extends React.Component {
   };
 
   loadTimelineData = async (date) => {
-    if (!this.driver) return;
-
-    const session = this.driver.session({ database: neo4jDb() });
+    if (!this.driver || !date) return;
     try {
-      const timestamp = date.getTime();
-      
-
-      
-      // Query for nodes and relationships that existed at the given timestamp
-      const result = await session.run(
-        `MATCH (u:User)
-         WHERE u.createdAt IS NOT NULL AND u.createdAt <= $timestamp
-         OPTIONAL MATCH (u)-[r:CONNECTED_TO]->(v:User)
-         WHERE v.createdAt IS NOT NULL AND v.createdAt <= $timestamp
-         AND r.createdAt IS NOT NULL AND r.createdAt <= $timestamp
-         RETURN u.name AS source, u.role AS sourceRole, u.location AS sourceLocation, u.website AS sourceWebsite, u.email AS sourceEmail,
-                v.name AS target, v.role AS targetRole, v.location AS targetLocation, v.website AS targetWebsite, v.email AS targetEmail`,
-        { timestamp }
-      );
-
-      const nodesMap = new Map();
-      const links = [];
-
-      result.records.forEach(record => {
-        const source = record.get('source');
-        const target = record.get('target');
-        const sourceRole = record.get('sourceRole');
-        const targetRole = record.get('targetRole');
-        const sourceLocation = record.get('sourceLocation');
-        const targetLocation = record.get('targetLocation');
-        const sourceWebsite = record.get('sourceWebsite');
-        const targetWebsite = record.get('targetWebsite');
-        const sourceEmail = record.get('sourceEmail');
-        const targetEmail = record.get('targetEmail');
-
-        // Add source node with properties
-        if (source && !nodesMap.has(source)) {
-          nodesMap.set(source, {
-            name: source,
-            role: sourceRole || '',
-            location: sourceLocation || '',
-            website: sourceWebsite || '',
-            email: sourceEmail || '',
-            x: Math.random() * 500,
-            y: Math.random() * 500,
-          });
-        }
-        
-        // Add target node with properties if there's a relationship
-        if (target && !nodesMap.has(target)) {
-          nodesMap.set(target, {
-            name: target,
-            role: targetRole || '',
-            location: targetLocation || '',
-            website: targetWebsite || '',
-            email: targetEmail || '',
-            x: Math.random() * 500,
-            y: Math.random() * 500,
-          });
-        }
-        
-        // Add link if there's a relationship
-        if (target) {
-          links.push({
-            source,
-            target,
-            sourceRole,
-            targetRole,
-            sourceLocation,
-            targetLocation,
-            sourceWebsite,
-            targetWebsite
-          });
-        }
-      });
-
-      const timelineData = {
-        nodes: Array.from(nodesMap.values()),
-        links
-      };
-
-
-
-      this.setState({
-        timelineData,
-        timelineDate: date
-      });
-
+      await this.ensureTimelineEventsLoaded();
+      this.applyTimelineTimestamp(date);
     } catch (error) {
       console.error('Error loading timeline data:', error);
-    } finally {
-      session.close();
     }
   };
 
   updateTimelineDate = (date) => {
-    this.loadTimelineData(date);
+    if (this.timelineEvents) {
+      this.applyTimelineTimestamp(date);
+    } else {
+      this.loadTimelineData(date);
+    }
   };
 
   getTimelineStats = async () => {
@@ -1384,8 +1430,6 @@ class CypherViz extends React.Component {
   refreshTimelineStats = async () => {
     if (this.state.timelineMode) {
       const stats = await this.getTimelineStats();
-      
-      // Ensure timeline date stays within valid range
       let newTimelineDate = this.state.timelineDate;
       if (stats && this.state.timelineDate) {
         if (this.state.timelineDate.getTime() > stats.latest.getTime()) {
@@ -1394,16 +1438,13 @@ class CypherViz extends React.Component {
           newTimelineDate = stats.earliest;
         }
       }
-      
-      this.setState({ 
-        timelineStats: stats,
-        timelineDate: newTimelineDate
+      this.timelineEvents = null;
+      await this.ensureTimelineEventsLoaded();
+      this.setState({ timelineStats: stats }, () => {
+        if (newTimelineDate) {
+          this.applyTimelineTimestamp(newTimelineDate);
+        }
       });
-      
-      // Reload timeline data if date changed
-      if (newTimelineDate && newTimelineDate.getTime() !== this.state.timelineDate?.getTime()) {
-        this.loadTimelineData(newTimelineDate);
-      }
     }
   };
 
@@ -1413,7 +1454,16 @@ class CypherViz extends React.Component {
       <div>
       <Routes>
       <Route path="/reset" element={<ResetPhone />} />
-      <Route path="/:username" element={<NFCTrigger addNode={this.addNodeNFC} />} />
+      <Route
+        path="/:username"
+        element={
+          <NFCTrigger
+            addNode={this.addNodeNFC}
+            registerAndConnect={this.registerOwnerAndConnectNFC}
+            ensureOwner={this.ensurePhoneOwnerNode}
+          />
+        }
+      />
       <Route path="/" element={
         <GraphView 
         data={this.state.data} 
@@ -1435,6 +1485,7 @@ class CypherViz extends React.Component {
         toggleTimelineMode={this.toggleTimelineMode}
         loadTimelineData={this.loadTimelineData}
         updateTimelineDate={this.updateTimelineDate}
+        stepTimelineForward={this.stepTimelineForward}
         resetToCurrentTime={this.resetToCurrentTime}
     />
   } />
@@ -1447,21 +1498,49 @@ class CypherViz extends React.Component {
 }
 }
 
-const NFCTrigger = ({ addNode }) => {
+const nfcButtonStyle = {
+  padding: "12px 24px",
+  fontSize: "16px",
+  border: "none",
+  borderRadius: "6px",
+  cursor: "pointer",
+  margin: "6px",
+};
+
+const graphToolbarBtn = {
+  backgroundColor: "#fff",
+  color: "#000",
+  border: "1px solid #000",
+};
+
+const graphToolbarBtnActive = {
+  backgroundColor: "#000",
+  color: "#fff",
+  border: "1px solid #000",
+};
+
+const NFCTrigger = ({ addNode, registerAndConnect, ensureOwner }) => {
   const { username } = useParams();
-  const [status, setStatus] = useState(null); // 'setup' | 'connecting' | 'connected' | 'self' | 'error'
+  const cardName = username ? decodeURIComponent(username) : "";
+  const [status, setStatus] = useState(null);
   const [phoneOwner, setPhoneOwner] = useState(() => localStorage.getItem(PHONE_OWNER_KEY));
+  const [profileForm, setProfileForm] = useState({
+    name: "",
+    school: "",
+    role: "",
+    email: "",
+    website: "",
+  });
+  const [formError, setFormError] = useState("");
 
   useEffect(() => {
     if (!username) return;
 
-    // Case 1: No phone owner set — first-time setup
     if (!phoneOwner) {
-      setStatus("setup");
+      setStatus("confirm-identity");
       return;
     }
 
-    // Case 2: Tapped own card — no-op, redirect home
     if (username.toLowerCase() === phoneOwner.toLowerCase()) {
       setStatus("self");
       setTimeout(() => {
@@ -1470,12 +1549,10 @@ const NFCTrigger = ({ addNode }) => {
       return;
     }
 
-    // Case 3: Tapped someone else's card — auto-connect
     const connectAndRedirect = async () => {
       setStatus("connecting");
       try {
         await addNode(username, phoneOwner);
-        console.log(`NFC Trigger: Connected ${phoneOwner} with ${username}`);
         setStatus("connected");
       } catch (error) {
         console.error("NFC Trigger: Error adding connection:", error);
@@ -1487,48 +1564,197 @@ const NFCTrigger = ({ addNode }) => {
     };
 
     connectAndRedirect();
-  }, [username, phoneOwner]);
+  }, [username, phoneOwner, addNode]);
 
-  const handleSetup = () => {
-    localStorage.setItem(PHONE_OWNER_KEY, username);
-    setPhoneOwner(username);
-    setStatus("setup-complete");
+  const redirectHomeSoon = (delayMs = 2000) => {
     setTimeout(() => {
       window.location.assign(homeUrl());
-    }, 2000);
+    }, delayMs);
+  };
+
+  const handleClaimCard = async () => {
+    const ownerName = capitalizeDisplayName(cardName);
+    setStatus("connecting");
+    try {
+      await ensureOwner(ownerName);
+      localStorage.setItem(PHONE_OWNER_KEY, ownerName);
+      setPhoneOwner(ownerName);
+      setStatus("setup-complete");
+      redirectHomeSoon();
+    } catch (error) {
+      console.error("NFC claim card failed:", error);
+      setStatus("error");
+    }
+  };
+
+  const handleProfileChange = (event) => {
+    const { name, value } = event.target;
+    setProfileForm((prev) => ({ ...prev, [name]: value }));
+    setFormError("");
+  };
+
+  const handleOnboardingSubmit = async (event) => {
+    event.preventDefault();
+    const trimmedName = profileForm.name.trim();
+    if (!trimmedName) {
+      setFormError("Please enter your name.");
+      return;
+    }
+
+    const ownerName = capitalizeDisplayName(trimmedName);
+    localStorage.setItem(PHONE_OWNER_KEY, ownerName);
+    setPhoneOwner(ownerName);
+    setStatus("connecting");
+
+    try {
+      await registerAndConnect(cardName, {
+        name: ownerName,
+        school: profileForm.school.trim(),
+        role: profileForm.role.trim(),
+        email: profileForm.email.trim(),
+        website: profileForm.website.trim(),
+        links: "",
+      });
+      setStatus("connected");
+      redirectHomeSoon();
+    } catch (error) {
+      console.error("NFC onboarding failed:", error);
+      localStorage.removeItem(PHONE_OWNER_KEY);
+      setPhoneOwner(null);
+      setStatus("error");
+    }
   };
 
   return (
-    <div style={{ textAlign: "center", padding: "40px 20px", fontSize: "18px", fontFamily: "sans-serif" }}>
-      {status === "setup" && (
+    <div style={{ textAlign: "center", padding: "40px 20px", fontSize: "18px", fontFamily: "sans-serif", maxWidth: "420px", margin: "0 auto" }}>
+      {status === "confirm-identity" && (
         <div>
-          <p style={{ fontSize: "22px", marginBottom: "10px" }}>Set up this phone as <strong>{username}</strong>'s device?</p>
-          <p style={{ color: "#666", fontSize: "14px", marginBottom: "20px" }}>Tap your own card once to link with your phone. After that, tapping other people's cards will add them to your network.</p>
+          <p style={{ fontSize: "22px", marginBottom: "10px" }}>
+            <strong>{cardName}</strong> shared their networking card
+          </p>
+          <p style={{ color: "#666", fontSize: "14px", marginBottom: "24px" }}>
+            Is this <em>your</em> card? Only choose yes if this phone should be linked to {cardName}. Otherwise set up your own profile and we&apos;ll add {cardName} to your network.
+          </p>
           <button
-            onClick={handleSetup}
-            style={{ padding: "12px 32px", fontSize: "16px", backgroundColor: "#4CAF50", color: "white", border: "none", borderRadius: "6px", cursor: "pointer" }}
+            type="button"
+            onClick={handleClaimCard}
+            style={{ ...nfcButtonStyle, backgroundColor: "#4CAF50", color: "white" }}
           >
-            Yes, this is me
+            Yes, this is my card
+          </button>
+          <button
+            type="button"
+            onClick={() => setStatus("onboarding")}
+            style={{ ...nfcButtonStyle, backgroundColor: "#2196F3", color: "white" }}
+          >
+            No, I&apos;m someone else
           </button>
         </div>
       )}
+
+      {status === "onboarding" && (
+        <form onSubmit={handleOnboardingSubmit} style={{ textAlign: "left" }}>
+          <p style={{ fontSize: "20px", textAlign: "center", marginBottom: "8px" }}>Create your network profile</p>
+          <p style={{ color: "#666", fontSize: "14px", textAlign: "center", marginBottom: "20px" }}>
+            We&apos;ll register this phone and connect you with <strong>{cardName}</strong>.
+          </p>
+          <label style={{ display: "block", marginBottom: "12px" }}>
+            <span style={{ fontWeight: 600 }}>Name *</span>
+            <input
+              name="name"
+              value={profileForm.name}
+              onChange={handleProfileChange}
+              required
+              autoComplete="name"
+              style={{ display: "block", width: "100%", marginTop: "4px", padding: "10px", fontSize: "16px", boxSizing: "border-box" }}
+            />
+          </label>
+          <label style={{ display: "block", marginBottom: "12px" }}>
+            <span style={{ fontWeight: 600 }}>School</span>
+            <input
+              name="school"
+              value={profileForm.school}
+              onChange={handleProfileChange}
+              style={{ display: "block", width: "100%", marginTop: "4px", padding: "10px", fontSize: "16px", boxSizing: "border-box" }}
+            />
+          </label>
+          <label style={{ display: "block", marginBottom: "12px" }}>
+            <span style={{ fontWeight: 600 }}>Role</span>
+            <input
+              name="role"
+              value={profileForm.role}
+              onChange={handleProfileChange}
+              placeholder="e.g. Graduate student, Founder"
+              style={{ display: "block", width: "100%", marginTop: "4px", padding: "10px", fontSize: "16px", boxSizing: "border-box" }}
+            />
+          </label>
+          <label style={{ display: "block", marginBottom: "12px" }}>
+            <span style={{ fontWeight: 600 }}>Email</span>
+            <input
+              name="email"
+              type="email"
+              value={profileForm.email}
+              onChange={handleProfileChange}
+              autoComplete="email"
+              style={{ display: "block", width: "100%", marginTop: "4px", padding: "10px", fontSize: "16px", boxSizing: "border-box" }}
+            />
+          </label>
+          <label style={{ display: "block", marginBottom: "16px" }}>
+            <span style={{ fontWeight: 600 }}>LinkedIn URL</span>
+            <input
+              name="website"
+              type="url"
+              value={profileForm.website}
+              onChange={handleProfileChange}
+              placeholder="https://linkedin.com/in/..."
+              style={{ display: "block", width: "100%", marginTop: "4px", padding: "10px", fontSize: "16px", boxSizing: "border-box" }}
+            />
+          </label>
+          {formError && <p style={{ color: "red", fontSize: "14px" }}>{formError}</p>}
+          <div style={{ textAlign: "center" }}>
+            <button
+              type="button"
+              onClick={() => setStatus("confirm-identity")}
+              style={{ ...nfcButtonStyle, backgroundColor: "#999", color: "white" }}
+            >
+              Back
+            </button>
+            <button
+              type="submit"
+              style={{ ...nfcButtonStyle, backgroundColor: "#4CAF50", color: "white" }}
+            >
+              Save &amp; connect
+            </button>
+          </div>
+        </form>
+      )}
+
       {status === "setup-complete" && (
         <div>
-          <p style={{ color: "#4CAF50", fontSize: "22px" }}>You're all set, {username}!</p>
+          <p style={{ color: "#4CAF50", fontSize: "22px" }}>You&apos;re all set, {capitalizeDisplayName(cardName)}!</p>
           <p style={{ color: "#666", fontSize: "14px" }}>Redirecting to your network...</p>
         </div>
       )}
       {status === "connecting" && (
-        <p style={{ color: "#2196F3" }}>Connecting with {username}...</p>
+        <p style={{ color: "#2196F3" }}>Setting up your profile and connecting with {cardName}...</p>
       )}
       {status === "connected" && (
-        <p style={{ color: "#4CAF50" }}>Connected with {username}!</p>
+        <p style={{ color: "#4CAF50" }}>Connected with {cardName}! Opening your network...</p>
       )}
       {status === "self" && (
-        <p style={{ color: "#666" }}>Welcome back, {username}! Redirecting...</p>
+        <p style={{ color: "#666" }}>Welcome back, {cardName}! Redirecting...</p>
       )}
       {status === "error" && (
-        <p style={{ color: "red" }}>Something went wrong. Please try again.</p>
+        <div>
+          <p style={{ color: "red" }}>Something went wrong. Please try again.</p>
+          <button
+            type="button"
+            onClick={() => setStatus("confirm-identity")}
+            style={{ ...nfcButtonStyle, backgroundColor: "#2196F3", color: "white" }}
+          >
+            Try again
+          </button>
+        </div>
       )}
     </div>
   );
@@ -1584,7 +1810,45 @@ const ResetPhone = () => {
   );
 };
 
-              const GraphView = ({ data, handleChange, loadData, fgRef, latestNode, pollingFocusNode, driver, processingMutation, updateUserActivity, isUserActive, scaleTransitionStart, scaleTransitionDuration, timelineMode, timelineDate, timelineData, timelineStats, toggleTimelineMode, loadTimelineData, updateTimelineDate, resetToCurrentTime }) => {
+              const GraphView = ({ data, handleChange, loadData, fgRef, latestNode, pollingFocusNode, driver, processingMutation, updateUserActivity, isUserActive, scaleTransitionStart, scaleTransitionDuration, timelineMode, timelineDate, timelineData, timelineStats, toggleTimelineMode, loadTimelineData, updateTimelineDate, stepTimelineForward, resetToCurrentTime }) => {
+        const viewerName = localStorage.getItem(PHONE_OWNER_KEY);
+        const [mainView, setMainView] = useState(() =>
+          localStorage.getItem(PHONE_OWNER_KEY) ? 'insights' : 'graph'
+        );
+        const [participantInsights, setParticipantInsights] = useState(null);
+        const [insightsLoading, setInsightsLoading] = useState(false);
+        const [insightsError, setInsightsError] = useState(null);
+
+        const refreshParticipantInsights = useCallback(async () => {
+          if (!driver || !viewerName) {
+            setParticipantInsights(null);
+            setInsightsError(null);
+            return;
+          }
+          setInsightsLoading(true);
+          setInsightsError(null);
+          try {
+            const result = await loadParticipantNetworkInsights(driver, neo4jDb(), viewerName);
+            if (result.error) {
+              setInsightsError(result.error);
+              setParticipantInsights(null);
+            } else {
+              setParticipantInsights(result);
+            }
+          } catch (err) {
+            console.error('Failed to load participant insights:', err);
+            setInsightsError('load_failed');
+          } finally {
+            setInsightsLoading(false);
+          }
+        }, [driver, viewerName]);
+
+        useEffect(() => {
+          if (mainView === 'insights') {
+            refreshParticipantInsights();
+          }
+        }, [mainView, refreshParticipantInsights, data.links.length, data.nodes.length]);
+
         const [inputValue, setInputValue] = useState(""); 
         const [selectedNode, setSelectedNode] = useState(null);
         const [editedNode, setEditedNode] = useState(null);
@@ -1597,7 +1861,43 @@ const ResetPhone = () => {
         const [hoveredNode, setHoveredNode] = useState(null); // Node hover visual feedback
         const [focusTimeout, setFocusTimeout] = useState(null); // Track focus timeout
         const [autoZoomTriggered, setAutoZoomTriggered] = useState(false); // Track if auto-zoom has been triggered
+        const [timelinePlaying, setTimelinePlaying] = useState(false);
         const graphData = timelineMode && timelineData ? timelineData : data;
+
+        useEffect(() => {
+          if (!timelineMode) {
+            setTimelinePlaying(false);
+          }
+        }, [timelineMode]);
+
+        useEffect(() => {
+          if (!timelinePlaying || !timelineMode || !stepTimelineForward) return undefined;
+          const tickMs = 450;
+          const stepMs = 60000;
+          const id = setInterval(() => {
+            const atEnd = stepTimelineForward(stepMs);
+            if (atEnd) setTimelinePlaying(false);
+          }, tickMs);
+          return () => clearInterval(id);
+        }, [timelinePlaying, timelineMode, stepTimelineForward]);
+
+        // Timeline: static pinned layout — disable forces so graphData updates do not re-simulate / flicker
+        useEffect(() => {
+          if (!timelineMode || !fgRef.current) return undefined;
+          const fg = fgRef.current;
+          fg.d3Force('link', null);
+          fg.d3Force('charge', null);
+          fg.d3Force('center', null);
+          fg.pauseAnimation();
+          return () => {
+            const g = fgRef.current;
+            if (!g) return;
+            g.d3Force('link', d3.forceLink().id((d) => d.name));
+            g.d3Force('charge', d3.forceManyBody());
+            g.d3Force('center', d3.forceCenter());
+            g.resumeAnimation();
+          };
+        }, [timelineMode, fgRef]);
 
         // Detect when latestNode changes (NFC addition) and set lastAction
         useEffect(() => {
@@ -1612,17 +1912,17 @@ const ResetPhone = () => {
           }
         }, [latestNode, focusTimeout]);
 
-        // Initial zoom when graph first loads
+        // Initial zoom when graph first loads (not in timeline — playback keeps a stable view)
         useEffect(() => {
+          if (timelineMode) return;
           if (fgRef.current && graphData.nodes.length > 0 && !lastAction) {
-            // Wait a bit for the graph to settle, then zoom to 2x
             setTimeout(() => {
-              if (fgRef.current) {
+              if (fgRef.current && !timelineMode) {
                 fgRef.current.zoom(2, 1000);
               }
             }, 1000);
           }
-        }, [graphData, fgRef, lastAction]);
+        }, [graphData, fgRef, lastAction, timelineMode]);
 
         // Compute 1-degree neighbors of latestNode
         const getOneDegreeNodes = () => {
@@ -1703,7 +2003,6 @@ const ResetPhone = () => {
           return distanceMap;
         };
 
-        const viewerName = localStorage.getItem(PHONE_OWNER_KEY);
         const viewerNode = viewerName
           ? graphData.nodes.find(
               (node) => node.name.toLowerCase() === viewerName.toLowerCase()
@@ -1714,6 +2013,7 @@ const ResetPhone = () => {
         const nodeDistanceMap = getNodeDistanceMap(stableViewerNode);
 
         const getNodeInfoTier = (nodeName) => {
+          if (timelineMode) return "nameOnly";
           const distance = nodeDistanceMap.get(nodeName);
           if (distance === undefined) return "minimal";
           if (distance <= 1) return "full";
@@ -1733,7 +2033,8 @@ const ResetPhone = () => {
         if (inputValue && inputValue.trim()) {
           const searchMatches = graphData.nodes.filter(node => 
             node.name.toLowerCase().includes(inputValue.toLowerCase()) ||
-            (node.location && node.location.toLowerCase().includes(inputValue.toLowerCase())) ||
+            (node.school && node.school.toLowerCase().includes(inputValue.toLowerCase())) ||
+            (node.links && node.links.toLowerCase().includes(inputValue.toLowerCase())) ||
             (node.role && node.role.toLowerCase().includes(inputValue.toLowerCase())) ||
             (node.website && node.website.toLowerCase().includes(inputValue.toLowerCase()))
           );
@@ -1755,7 +2056,8 @@ const ResetPhone = () => {
                          (() => {
                           const searchMatches = graphData.nodes.filter(node => 
                              node.name.toLowerCase().includes(inputValue.toLowerCase()) ||
-                             (node.location && node.location.toLowerCase().includes(inputValue.toLowerCase())) ||
+                             (node.school && node.school.toLowerCase().includes(inputValue.toLowerCase())) ||
+            (node.links && node.links.toLowerCase().includes(inputValue.toLowerCase())) ||
                              (node.role && node.role.toLowerCase().includes(inputValue.toLowerCase())) ||
                              (node.website && node.website.toLowerCase().includes(inputValue.toLowerCase()))
                            );
@@ -1779,6 +2081,7 @@ const ResetPhone = () => {
         
         // Auto-zoom to visible nodes with temporary focus behavior
         useEffect(() => {
+          if (timelineMode) return;
           // Only run auto-zoom if it hasn't been triggered yet and we have a valid action
           if (autoZoomTriggered || !fgRef.current || !lastAction) {
             return;
@@ -1842,7 +2145,7 @@ const ResetPhone = () => {
             // If no nodes to zoom to, reset the flag immediately
             setAutoZoomTriggered(false);
           }
-        }, [lastAction, clickedNode, latestNode, inputValue, mutatedNodes]); // Removed focusTimeout from dependencies
+        }, [lastAction, clickedNode, latestNode, inputValue, mutatedNodes, timelineMode]); // Removed focusTimeout from dependencies
 
         // Cleanup focus timeout and reset flags on unmount
         useEffect(() => {
@@ -2001,22 +2304,22 @@ const ResetPhone = () => {
                   MATCH (u:User)
                   WHERE toLower(u.name) = toLower($nodeName)
                   OPTIONAL MATCH (u)-[r:CONNECTED_TO]->(v:User)
-                  RETURN u.name AS sourceName, u.role AS sourceRole, u.location AS sourceLocation, u.website AS sourceWebsite, u.email AS sourceEmail,
-                         v.name AS targetName, v.role AS targetRole, v.location AS targetLocation, v.website AS targetWebsite, v.email AS targetEmail,
+                  RETURN u.name AS sourceName, u.role AS sourceRole, u.school AS sourceSchool, u.website AS sourceWebsite, u.email AS sourceEmail, u.links AS sourceLinks,
+                         v.name AS targetName, v.role AS targetRole, v.school AS targetSchool, v.website AS targetWebsite, v.email AS targetEmail, v.links AS targetLinks,
                          r.note AS connectionNote, r.createdAt AS connectionTime
                   UNION
                   MATCH (v:User)-[r:CONNECTED_TO]->(u:User)
                   WHERE toLower(u.name) = toLower($nodeName)
-                  RETURN v.name AS sourceName, v.role AS sourceRole, v.location AS sourceLocation, v.website AS sourceWebsite, v.email AS sourceEmail,
-                         u.name AS targetName, u.role AS targetRole, u.location AS targetLocation, u.website AS targetWebsite, u.email AS targetEmail,
+                  RETURN v.name AS sourceName, v.role AS sourceRole, v.school AS sourceSchool, v.website AS sourceWebsite, v.email AS sourceEmail, v.links AS sourceLinks,
+                         u.name AS targetName, u.role AS targetRole, u.school AS targetSchool, u.website AS targetWebsite, u.email AS targetEmail, u.links AS targetLinks,
                          r.note AS connectionNote, r.createdAt AS connectionTime
                   UNION
                   MATCH (u:User)
                   WHERE toLower(u.name) = toLower($nodeName)
                   AND NOT EXISTS((u)-[:CONNECTED_TO]->())
                   AND NOT EXISTS(()-[:CONNECTED_TO]->(u))
-                  RETURN u.name AS sourceName, u.role AS sourceRole, u.location AS sourceLocation, u.website AS sourceWebsite, u.email AS sourceEmail,
-                         null AS targetName, null AS targetRole, null AS targetLocation, null AS targetWebsite, null AS targetEmail,
+                  RETURN u.name AS sourceName, u.role AS sourceRole, u.school AS sourceSchool, u.website AS sourceWebsite, u.email AS sourceEmail, u.links AS sourceLinks,
+                         null AS targetName, null AS targetRole, null AS targetSchool, null AS targetWebsite, null AS targetEmail, null AS targetLinks,
                          null AS connectionNote, null AS connectionTime
                 `;
                 
@@ -2032,7 +2335,7 @@ const ResetPhone = () => {
                   const fuzzyQuery = `
                     MATCH (u:User)
                     WHERE toLower(u.name) CONTAINS toLower($nodeName)
-                    RETURN u.name AS name, u.role AS role, u.location AS location
+                    RETURN u.name AS name, u.role AS role, u.school AS school
                     LIMIT 5
                   `;
                   const fuzzyResult = await session.run(fuzzyQuery, { nodeName });
@@ -2161,8 +2464,8 @@ const ResetPhone = () => {
                 // Immediately return to default query without any delay
                 const defaultQuery = `
                   MATCH (u:User)-[r:CONNECTED_TO]->(v:User)
-                  RETURN u.name AS source, u.role AS sourceRole, u.location AS sourceLocation, u.website AS sourceWebsite, u.email AS sourceEmail,
-                         v.name AS target, v.role AS targetRole, v.location AS targetLocation, v.website AS targetWebsite, v.email AS targetEmail
+                  RETURN u.name AS source, u.role AS sourceRole, u.school AS sourceSchool, u.website AS sourceWebsite, u.email AS sourceEmail, u.links AS sourceLinks,
+                         v.name AS target, v.role AS targetRole, v.school AS targetSchool, v.website AS targetWebsite, v.email AS targetEmail, v.links AS targetLinks
                 `;
                 await loadData(null, defaultQuery);
               }
@@ -2258,8 +2561,14 @@ const ResetPhone = () => {
               
               // Merge properties: keep non-empty values from either node
               const mergedRole = existingNode.role && existingNode.role !== '' ? existingNode.role : editedNode.role;
-              const mergedLocation = existingNode.location && existingNode.location !== '' ? existingNode.location : editedNode.location;
+              const mergedSchool =
+                (existingNode.school || existingNode.location) &&
+                (existingNode.school || existingNode.location) !== ''
+                  ? existingNode.school || existingNode.location
+                  : editedNode.school || editedNode.location || '';
               const mergedWebsite = existingNode.website && existingNode.website !== '' ? existingNode.website : editedNode.website;
+              const mergedLinks =
+                existingNode.links && existingNode.links !== '' ? existingNode.links : editedNode.links || '';
               
               // Efficiently merge all relationships and delete old node in a single operation
               await session.run(
@@ -2293,16 +2602,18 @@ const ResetPhone = () => {
               // Update the existing node with merged properties
               await session.run(
                 `MATCH (u:User {name: $newName})
-                 SET u.role = $role, u.location = $location, u.website = $website`,
+                 SET u.role = $role, u.school = $school, u.website = $website, u.links = $links
+                 REMOVE u.location`,
                 {
                   newName: newName,
                   role: mergedRole,
-                  location: mergedLocation,
-                  website: mergedWebsite
+                  school: mergedSchool,
+                  website: mergedWebsite,
+                  links: mergedLinks,
                 }
               );
               
-              console.log(`Successfully merged nodes. New node "${newName}" has properties:`, { mergedRole, mergedLocation, mergedWebsite });
+              console.log(`Successfully merged nodes. New node "${newName}" has properties:`, { mergedRole, mergedSchool, mergedWebsite, mergedLinks });
               
               // Focus on the merged node
               await loadData(newName);
@@ -2340,13 +2651,15 @@ const ResetPhone = () => {
           try {
             await session.run(
               `MATCH (u:User {name: $oldName}) 
-              SET u.name = $newName, u.role = $role, u.location = $location, u.website = $website`,
+              SET u.name = $newName, u.role = $role, u.school = $school, u.website = $website, u.links = $links
+              REMOVE u.location`,
               {
                 oldName: selectedNode.name,
                 newName: capitalizeWords(editedNode.name),
                 role: editedNode.role || '',
-                location: editedNode.location || '',
-                website: editedNode.website || ''
+                school: editedNode.school || editedNode.location || '',
+                website: editedNode.website || '',
+                links: editedNode.links || '',
               }
             );
             await loadData(capitalizeWords(editedNode.name));
@@ -2402,28 +2715,32 @@ const ResetPhone = () => {
             }
           }
 
-          // Handle location-based queries
-          if (questionLower.includes('where') || questionLower.includes('location')) {
-            let locations = [];
-            
-            // Try different case variations for location field
-            if (records[0].keys && records[0].keys.includes('location')) {
-              locations = records.map(record => record.get('location')).filter(Boolean);
-            } else if (records[0].keys && records[0].keys.includes('Location')) {
-              locations = records.map(record => record.get('Location')).filter(Boolean);
+          // Handle school-based queries (legacy location field still supported)
+          if (
+            questionLower.includes('school') ||
+            questionLower.includes('where') ||
+            questionLower.includes('location')
+          ) {
+            let schools = [];
+
+            if (records[0].keys && records[0].keys.includes('school')) {
+              schools = records.map(record => record.get('school')).filter(Boolean);
+            } else if (records[0].keys && records[0].keys.includes('location')) {
+              schools = records.map(record => record.get('location')).filter(Boolean);
+            } else if (records[0].keys && records[0].keys.includes('u_school')) {
+              schools = records.map(record => record.get('u_school')).filter(Boolean);
             } else if (records[0].keys && records[0].keys.includes('u_location')) {
-              locations = records.map(record => record.get('u_location')).filter(Boolean);
-            } else if (records[0].keys && records[0].keys.includes('u_Location')) {
-              locations = records.map(record => record.get('u_Location')).filter(Boolean);
+              schools = records.map(record => record.get('u_location')).filter(Boolean);
             } else {
-              locations = records.map(record => record.get(0)).filter(Boolean);
+              schools = records.map(record => record.get(0)).filter(Boolean);
             }
-            
-            const uniqueLocations = [...new Set(locations)];
-            if (uniqueLocations.length === 1) {
-              return `The location is ${uniqueLocations[0]}.`;
-            } else {
-              return `The locations found are: ${uniqueLocations.join(', ')}.`;
+
+            const uniqueSchools = [...new Set(schools)];
+            if (uniqueSchools.length === 1) {
+              return `The school is ${uniqueSchools[0]}.`;
+            }
+            if (uniqueSchools.length > 1) {
+              return `The schools found are: ${uniqueSchools.join(', ')}.`;
             }
           }
 
@@ -2541,11 +2858,9 @@ const ResetPhone = () => {
 
           records.forEach(record => {
             const sourceName = record.get('sourceName');
-            const sourceRole = record.get('sourceRole');
-            const sourceLocation = record.get('sourceLocation');
             const targetName = record.get('targetName');
-            const targetRole = record.get('targetRole');
-            const targetLocation = record.get('targetLocation');
+            const sourceProfile = profileFromRecord(record, 'source');
+            const targetProfile = profileFromRecord(record, 'target');
             const connectionNote = record.get('connectionNote');
             const connectionTime = record.get('connectionTime');
 
@@ -2553,15 +2868,15 @@ const ResetPhone = () => {
             if (sourceName) {
               users.set(sourceName, {
                 name: sourceName,
-                role: sourceRole,
-                location: sourceLocation
+                role: sourceProfile.role,
+                school: sourceProfile.school,
               });
             }
             if (targetName) {
               users.set(targetName, {
                 name: targetName,
-                role: targetRole,
-                location: targetLocation
+                role: targetProfile.role,
+                school: targetProfile.school,
               });
             }
 
@@ -2586,8 +2901,8 @@ const ResetPhone = () => {
             .map(([name, count]) => ({ name, count }));
 
           // Analyze demographics
-          const locations = Array.from(users.values()).map(u => u.location).filter(Boolean);
-          const uniqueLocations = [...new Set(locations)];
+          const schools = Array.from(users.values()).map(u => u.school).filter(Boolean);
+          const uniqueSchools = [...new Set(schools)];
           const roles = Array.from(users.values()).map(u => u.role).filter(Boolean);
           const uniqueRoles = [...new Set(roles)];
 
@@ -2606,7 +2921,7 @@ ${topConnectors.slice(0, 5).map((connector, index) =>
 ).join('\n')}
 
 ## **🌍 Demographics & Participation**
-- **Geographic Diversity**: ${uniqueLocations.length} unique locations
+- **School diversity**: ${uniqueSchools.length} unique schools
 - **Professional Diversity**: ${uniqueRoles.length} unique roles
 - **Participation Rate**: ${Math.round((connections.length / (users.size * (users.size - 1) / 2)) * 100)}% of possible connections
 
@@ -2616,13 +2931,13 @@ ${topConnectors.slice(0, 5).map((connector, index) =>
 | **Total Users** | ${users.size} |
 | **Total Connections** | ${connections.length} |
 | **Average Connections per User** | ${Math.round(connections.length / users.size * 2)} |
-| **Unique Locations** | ${uniqueLocations.length} |
+| **Unique Schools** | ${uniqueSchools.length} |
 | **Unique Roles** | ${uniqueRoles.length} |
 
 ## **💡 Key Insights**
 - The network shows ${connections.length > users.size * 2 ? 'strong' : connections.length > users.size ? 'moderate' : 'limited'} connectivity
 - Top connectors demonstrate effective networking skills
-- Geographic and professional diversity enhance network value
+- School and professional diversity enhance network value
 
 ## **🎯 Recommendations**
 - Encourage more connections between different communities
@@ -2649,15 +2964,9 @@ ${topConnectors.slice(0, 5).map((connector, index) =>
 
           records.forEach((record, index) => {
             const sourceName = record.get('sourceName');
-            const sourceRole = record.get('sourceRole');
-            const sourceLocation = record.get('sourceLocation');
-            const sourceWebsite = record.get('sourceWebsite');
-            const sourceEmail = record.get('sourceEmail');
             const targetName = record.get('targetName');
-            const targetRole = record.get('targetRole');
-            const targetLocation = record.get('targetLocation');
-            const targetWebsite = record.get('targetWebsite');
-            const targetEmail = record.get('targetEmail');
+            const sourceProfile = profileFromRecord(record, 'source');
+            const targetProfile = profileFromRecord(record, 'target');
             const connectionNote = record.get('connectionNote');
             const connectionTime = record.get('connectionTime');
             
@@ -2666,30 +2975,31 @@ ${topConnectors.slice(0, 5).map((connector, index) =>
             // Store node info (case-insensitive comparison)
             if (sourceName && sourceName.toLowerCase() === nodeName.toLowerCase()) {
               nodeInfo.name = sourceName;
-              nodeInfo.role = sourceRole;
-              nodeInfo.location = sourceLocation;
-              nodeInfo.website = sourceWebsite;
-              nodeInfo.email = sourceEmail;
-              console.log("Found node info from source:", { name: sourceName, role: sourceRole, location: sourceLocation });
+              nodeInfo.role = sourceProfile.role;
+              nodeInfo.school = sourceProfile.school;
+              nodeInfo.website = sourceProfile.website;
+              nodeInfo.email = sourceProfile.email;
+              nodeInfo.links = sourceProfile.links;
+              console.log("Found node info from source:", { name: sourceName, role: sourceProfile.role, school: sourceProfile.school });
             } else if (targetName && targetName.toLowerCase() === nodeName.toLowerCase()) {
               nodeInfo.name = targetName;
-              nodeInfo.role = targetRole;
-              nodeInfo.location = targetLocation;
-              nodeInfo.website = targetWebsite;
-              nodeInfo.email = targetEmail;
-              console.log("Found node info from target:", { name: targetName, role: targetRole, location: targetLocation });
+              nodeInfo.role = targetProfile.role;
+              nodeInfo.school = targetProfile.school;
+              nodeInfo.website = targetProfile.website;
+              nodeInfo.email = targetProfile.email;
+              nodeInfo.links = targetProfile.links;
+              console.log("Found node info from target:", { name: targetName, role: targetProfile.role, school: targetProfile.school });
             }
 
             // Count connections
             if (sourceName && targetName && sourceName !== targetName) {
               const otherPerson = sourceName === nodeName ? targetName : sourceName;
-              const otherRole = sourceName === nodeName ? targetRole : sourceRole;
-              const otherLocation = sourceName === nodeName ? targetLocation : sourceLocation;
+              const otherProfile = sourceName === nodeName ? targetProfile : sourceProfile;
               
               connectedUsers.set(otherPerson, {
                 name: otherPerson,
-                role: otherRole,
-                location: otherLocation,
+                role: otherProfile.role,
+                school: otherProfile.school,
                 note: connectionNote,
                 time: connectionTime
               });
@@ -2707,8 +3017,8 @@ ${topConnectors.slice(0, 5).map((connector, index) =>
           const totalConnections = connectedUsers.size;
           const roles = Array.from(connectedUsers.values()).map(u => u.role).filter(Boolean);
           const uniqueRoles = [...new Set(roles)];
-          const locations = Array.from(connectedUsers.values()).map(u => u.location).filter(Boolean);
-          const uniqueLocations = [...new Set(locations)];
+          const schools = Array.from(connectedUsers.values()).map(u => u.school).filter(Boolean);
+          const uniqueSchools = [...new Set(schools)];
 
           // Find most common connections
           const roleCounts = {};
@@ -2719,11 +3029,11 @@ ${topConnectors.slice(0, 5).map((connector, index) =>
             .sort((a, b) => b[1] - a[1])
             .slice(0, 3);
 
-          const locationCounts = {};
-          locations.forEach(location => {
-            locationCounts[location] = (locationCounts[location] || 0) + 1;
+          const schoolCounts = {};
+          schools.forEach(school => {
+            schoolCounts[school] = (schoolCounts[school] || 0) + 1;
           });
-          const topLocations = Object.entries(locationCounts)
+          const topSchools = Object.entries(schoolCounts)
             .sort((a, b) => b[1] - a[1])
             .slice(0, 3);
 
@@ -2735,7 +3045,7 @@ ${topConnectors.slice(0, 5).map((connector, index) =>
 ## **🎯 Profile Summary**
 - **Name**: ${nodeInfo.name || 'N/A'}
 - **Role**: ${nodeInfo.role || 'N/A'}
-- **Location**: ${nodeInfo.location || 'N/A'}
+- **School**: ${nodeInfo.school || 'N/A'}
 - **Email**: ${nodeInfo.email || 'N/A'}
 - **LinkedIn**: ${nodeInfo.website || 'N/A'}
 - **Total Connections**: ${totalConnections}
@@ -2743,7 +3053,7 @@ ${topConnectors.slice(0, 5).map((connector, index) =>
 ## **🔗 Connection Analysis**
 - **Network Reach**: ${totalConnections} direct connections
 - **Role Diversity**: ${uniqueRoles.length} different professional roles
-- **Geographic Reach**: ${uniqueLocations.length} different locations
+- **School reach**: ${uniqueSchools.length} different schools
 
 ## **📊 Top Connection Categories**
 
@@ -2752,23 +3062,23 @@ ${topRoles.map(([role, count]) =>
   `- **${role}**: ${count} connections`
 ).join('\n')}
 
-### **Most Connected Locations**
-${topLocations.map(([location, count]) => 
-  `- **${location}**: ${count} connections`
+### **Most Connected Schools**
+${topSchools.map(([school, count]) => 
+  `- **${school}**: ${count} connections`
 ).join('\n')}
 
 ## **🌍 Network Diversity**
 - **Professional Diversity**: ${uniqueRoles.length} unique roles
-- **Geographic Diversity**: ${uniqueLocations.length} unique locations
+- **School diversity**: ${uniqueSchools.length} unique schools
 - **Connection Quality**: ${connections.filter(c => c.note).length} connections with notes
 
 ## **💡 Key Insights**
 - ${nodeName} is a ${totalConnections > 20 ? 'super connector' : totalConnections > 10 ? 'active networker' : 'moderate connector'}
 - ${uniqueRoles.length > 3 ? 'High professional diversity' : 'Moderate professional diversity'} in connections
-- ${uniqueLocations.length > 5 ? 'Strong geographic reach' : 'Local to regional focus'} in networking
+- ${uniqueSchools.length > 5 ? 'Broad school mix' : 'Focused school connections'} in networking
 
 ## **🎯 Network Impact**
-- **Bridge Potential**: ${uniqueRoles.length > 2 && uniqueLocations.length > 3 ? 'High - connects diverse communities' : 'Moderate - focused connections'}
+- **Bridge Potential**: ${uniqueRoles.length > 2 && uniqueSchools.length > 3 ? 'High - connects diverse communities' : 'Moderate - focused connections'}
 - **Information Flow**: ${totalConnections > 15 ? 'Excellent - high connectivity' : totalConnections > 8 ? 'Good - moderate connectivity' : 'Limited - few connections'}
 - **Resource Sharing**: ${uniqueRoles.length > 2 ? 'Strong - diverse professional network' : 'Focused - similar professional backgrounds'}`;
 
@@ -2829,6 +3139,7 @@ ${topLocations.map(([location, count]) =>
 
 return (
     <div width="95%">
+      {mainView === 'graph' && (
       <input
         type="text"
         placeholder="Who else should I connect with?"
@@ -2842,10 +3153,31 @@ return (
           }
         }}
       />
-      <button id="info" onClick={() => window.open("https://www.hako.soooul.xyz/drafts/washi", "_blank")}>Info</button>
-      <button 
-        id="timeline" 
-        onClick={toggleTimelineMode}
+      )}
+      <button
+        id="connections"
+        type="button"
+        style={mainView === 'insights' ? graphToolbarBtnActive : graphToolbarBtn}
+        onClick={() => setMainView((view) => (view === 'insights' ? 'graph' : 'insights'))}
+      >
+        {mainView === 'insights' ? 'Exit Connections' : 'Connections'}
+      </button>
+      <button
+        id="info"
+        type="button"
+        style={graphToolbarBtn}
+        onClick={() => window.open("https://www.hako.soooul.xyz/drafts/washi", "_blank")}
+      >
+        Info
+      </button>
+      <button
+        id="timeline"
+        type="button"
+        onClick={() => {
+          if (mainView === 'insights') setMainView('graph');
+          toggleTimelineMode();
+        }}
+        style={timelineMode ? graphToolbarBtnActive : graphToolbarBtn}
       >
         {timelineMode ? 'Exit Timeline' : 'Timeline'}
       </button>
@@ -2859,24 +3191,27 @@ return (
         </button>
       )}
       
-      {/* Timeline Controls */}
+      {/* Timeline Controls — black & white to match main graph UI */}
       {timelineMode && (
         <div style={{
           position: 'fixed',
           bottom: '20px',
           left: '50%',
           transform: 'translateX(-50%)',
-          backgroundColor: 'white',
+          backgroundColor: '#fff',
           padding: '15px',
-          borderRadius: '8px',
-          boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+          borderRadius: '4px',
+          border: '1px solid #000',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.12)',
           zIndex: 1000,
           minWidth: '400px',
-          textAlign: 'center'
+          textAlign: 'center',
+          color: '#000',
         }}>
-          <h4 style={{ margin: '0 0 10px 0', color: '#333' }}>Network Timeline</h4>
+          <h4 style={{ margin: '0 0 10px 0', color: '#000', fontWeight: 600 }}>Network Timeline</h4>
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
             <button
+              type="button"
               onClick={() => {
                 if (timelineDate) {
                   const newDate = new Date(timelineDate.getTime() - 60000); // -1 minute
@@ -2884,13 +3219,13 @@ return (
                 }
               }}
               style={{
-                backgroundColor: '#2196F3',
-                color: 'white',
-                border: 'none',
+                backgroundColor: '#fff',
+                color: '#000',
+                border: '1px solid #000',
                 padding: '4px 8px',
                 borderRadius: '4px',
                 cursor: 'pointer',
-                fontSize: '10px'
+                fontSize: '10px',
               }}
             >
               -1m
@@ -2906,9 +3241,10 @@ return (
                 const date = new Date(timestamp);
                 updateTimelineDate(date);
               }}
-              style={{ flex: 1 }}
+              style={{ flex: 1, accentColor: '#000' }}
             />
             <button
+              type="button"
               onClick={() => {
                 if (timelineDate) {
                   const newDate = new Date(timelineDate.getTime() + 60000); // +1 minute
@@ -2916,23 +3252,24 @@ return (
                 }
               }}
               style={{
-                backgroundColor: '#2196F3',
-                color: 'white',
-                border: 'none',
+                backgroundColor: '#fff',
+                color: '#000',
+                border: '1px solid #000',
                 padding: '4px 8px',
                 borderRadius: '4px',
                 cursor: 'pointer',
-                fontSize: '10px'
+                fontSize: '10px',
               }}
             >
               +1m
             </button>
-            <span style={{ fontSize: '12px', color: '#666', minWidth: '120px' }}>
+            <span style={{ fontSize: '12px', color: '#000', minWidth: '120px' }}>
               {timelineDate ? `${timelineDate.toLocaleDateString()} ${timelineDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}` : 'Current Time'}
             </span>
           </div>
           <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', marginBottom: '10px' }}>
             <button
+              type="button"
               onClick={() => {
                 if (timelineDate) {
                   const newDate = new Date(timelineDate.getTime() - 300000); // -5 minutes
@@ -2940,33 +3277,55 @@ return (
                 }
               }}
               style={{
-                backgroundColor: '#4CAF50',
-                color: 'white',
-                border: 'none',
+                backgroundColor: '#fff',
+                color: '#000',
+                border: '1px solid #000',
                 padding: '4px 8px',
                 borderRadius: '4px',
                 cursor: 'pointer',
-                fontSize: '10px'
+                fontSize: '10px',
               }}
             >
               -5m
             </button>
 
             <button
-              onClick={() => loadTimelineData(new Date())}
+              type="button"
+              onClick={() => {
+                setTimelinePlaying(false);
+                if (timelineStats?.latest) {
+                  updateTimelineDate(timelineStats.latest);
+                }
+              }}
               style={{
-                backgroundColor: '#9C27B0',
-                color: 'white',
-                border: 'none',
+                backgroundColor: '#000',
+                color: '#fff',
+                border: '1px solid #000',
                 padding: '6px 12px',
                 borderRadius: '4px',
                 cursor: 'pointer',
-                fontSize: '12px'
+                fontSize: '12px',
               }}
             >
-              Load Current
+              Jump to end
             </button>
             <button
+              type="button"
+              onClick={() => setTimelinePlaying((p) => !p)}
+              style={{
+                backgroundColor: timelinePlaying ? '#000' : '#fff',
+                color: timelinePlaying ? '#fff' : '#000',
+                border: '1px solid #000',
+                padding: '6px 12px',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '12px',
+              }}
+            >
+              {timelinePlaying ? 'Pause' : 'Play'}
+            </button>
+            <button
+              type="button"
               onClick={() => {
                 if (timelineDate) {
                   const newDate = new Date(timelineDate.getTime() + 300000); // +5 minutes
@@ -2974,27 +3333,27 @@ return (
                 }
               }}
               style={{
-                backgroundColor: '#4CAF50',
-                color: 'white',
-                border: 'none',
+                backgroundColor: '#fff',
+                color: '#000',
+                border: '1px solid #000',
                 padding: '4px 8px',
                 borderRadius: '4px',
                 cursor: 'pointer',
-                fontSize: '10px'
+                fontSize: '10px',
               }}
             >
               +5m
             </button>
           </div>
           {timelineData && (
-            <div style={{ fontSize: '11px', color: '#666', display: 'flex', justifyContent: 'space-between' }}>
+            <div style={{ fontSize: '11px', color: '#333', display: 'flex', justifyContent: 'space-between' }}>
               <span>Nodes: {timelineData.nodes.length}</span>
               <span>Connections: {timelineData.links.length}</span>
               <span>Time: {timelineDate?.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'})}</span>
             </div>
           )}
           {timelineStats && (
-            <div style={{ fontSize: '10px', color: '#999', marginTop: '8px', textAlign: 'center' }}>
+            <div style={{ fontSize: '10px', color: '#666', marginTop: '8px', textAlign: 'center' }}>
               Timeline: {timelineStats.earliest?.toLocaleDateString()} {timelineStats.earliest?.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})} 
               to {timelineStats.latest?.toLocaleDateString()} {timelineStats.latest?.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
             </div>
@@ -3113,9 +3472,26 @@ return (
         }
       `}</style>
 
+  {mainView === 'insights' && (
+    <ParticipantInsightsPanel
+      insights={participantInsights}
+      loading={insightsLoading}
+      error={insightsError}
+      viewerName={viewerName}
+      onExploreGraph={() => setMainView('graph')}
+    />
+  )}
+
+  {mainView === 'graph' && (
+  <>
   <ForceGraph2D
   ref={fgRef}
   graphData={graphData}
+  warmupTicks={timelineMode ? 0 : undefined}
+  cooldownTicks={timelineMode ? 0 : undefined}
+  cooldownTime={timelineMode ? 0 : undefined}
+  d3AlphaMin={timelineMode ? 1 : undefined}
+  enableNodeDrag={!timelineMode}
   nodeId="name"
   nodeLabel={(node) => {
     const infoTier = getNodeInfoTier(node.name);
@@ -3146,7 +3522,8 @@ return (
     const isHighlighted =
       inputValue &&
       (node.name.toLowerCase().includes(inputValue.toLowerCase()) ||
-        (node.location && node.location.toLowerCase().includes(inputValue.toLowerCase())) ||
+        (node.school && node.school.toLowerCase().includes(inputValue.toLowerCase())) ||
+        (node.links && node.links.toLowerCase().includes(inputValue.toLowerCase())) ||
         (node.role && node.role.toLowerCase().includes(inputValue.toLowerCase())) ||
         (node.website && node.website.toLowerCase().includes(inputValue.toLowerCase())));
     const isNDegree = visibilityNodes.has(node.name);
@@ -3154,7 +3531,13 @@ return (
     const isViewerNode = viewerNode && node.name === viewerNode;
     const isNodeHovered = hoveredNode === node.name;
 
-    ctx.globalAlpha = isViewerNode ? 1.0 : (isNDegree ? 1.0 : 0.2);
+    ctx.globalAlpha = timelineMode
+      ? 1.0
+      : isViewerNode
+        ? 1.0
+        : isNDegree
+          ? 1.0
+          : 0.2;
     
     // Add breathing effect when user is idle or transitioning
     let nodeRadius = 6;
@@ -3164,12 +3547,12 @@ return (
     const frameRate = 60;
     const time = Math.floor(now / frameRate) * frameRate * 0.001;
     
-    if (!isUserActive) {
+    if (!timelineMode && !isUserActive) {
       // Optimized breathing effect with cached calculations
       // Use a simpler sine wave with reduced frequency for better performance
       const breathingScale = 1 + 0.1 * Math.sin(time * 0.8); // Reduced frequency from 1.5 to 0.8
       nodeRadius = 6 * breathingScale;
-    } else if (scaleTransitionStart && (now - scaleTransitionStart) < scaleTransitionDuration) {
+    } else if (!timelineMode && scaleTransitionStart && (now - scaleTransitionStart) < scaleTransitionDuration) {
       // Optimized transition with cached calculations
       const transitionProgress = Math.min((now - scaleTransitionStart) / scaleTransitionDuration, 1);
       // Cache the breathing scale calculation
@@ -3195,12 +3578,12 @@ return (
     }
     
     // Add subtle color shift during breathing animation
-    if (!isUserActive && fillColor === "white") {
+    if (!timelineMode && !isUserActive && fillColor === "white") {
       // Optimized color shift with reduced frequency and frame rate optimization
       const colorShift = Math.sin(time * 0.8) * 0.1;
       // Shift towards a very light blue during breathing
       fillColor = `rgb(${255 + colorShift * 50}, ${255 + colorShift * 30}, ${255 + colorShift * 100})`;
-    } else if (scaleTransitionStart && (now - scaleTransitionStart) < scaleTransitionDuration && fillColor === "white") {
+    } else if (!timelineMode && scaleTransitionStart && (now - scaleTransitionStart) < scaleTransitionDuration && fillColor === "white") {
       // Optimized color transition with cached calculations
       const transitionProgress = (now - scaleTransitionStart) / scaleTransitionDuration;
       // Cache the color shift calculation
@@ -3216,8 +3599,10 @@ return (
     ctx.strokeStyle = (isViewerNode || isNodeHovered) ? "black" : (isHighlighted ? "red" : "black");
     ctx.lineWidth = isHighlighted ? 3 : 2;
 
+    const px = node.x ?? 0;
+    const py = node.y ?? 0;
     ctx.beginPath();
-    ctx.arc(node.x || Math.random() * 500, node.y || Math.random() * 500, nodeRadius, 0, 2 * Math.PI);
+    ctx.arc(px, py, nodeRadius, 0, 2 * Math.PI);
     ctx.fill();
     ctx.stroke();
 
@@ -3228,19 +3613,20 @@ return (
     // Extract first name from full name
     if (infoTier !== "minimal") {
       const firstName = node.name.split(' ')[0];
-      ctx.fillText(firstName, node.x + 10, node.y);
+      ctx.fillText(firstName, px + 10, py);
     }
 
     ctx.globalAlpha = 1.0; // Reset alpha for next node
   }}
   linkColor={(link) => {
+    if (timelineMode) return '#999';
     const sourceName = typeof link.source === 'object' ? link.source.name : link.source;
     const targetName = typeof link.target === 'object' ? link.target.name : link.target;
     const isConnected = visibilityNodes.has(sourceName) && visibilityNodes.has(targetName);
-    
     return isConnected ? '#999' : '#ccc';
   }}
   linkOpacity={(link) => {
+    if (timelineMode) return 1.0;
     const sourceName = typeof link.source === 'object' ? link.source.name : link.source;
     const targetName = typeof link.target === 'object' ? link.target.name : link.target;
     const isConnected = visibilityNodes.has(sourceName) && visibilityNodes.has(targetName);
@@ -3266,20 +3652,40 @@ return (
           return (
             <>
               <p><strong>Name:</strong> {selectedNode?.name}</p>
-              {selectedNode?.role && <p><strong>Program:</strong> {selectedNode.role}</p>}
-              {selectedNode?.location && <p><strong>Location:</strong> {selectedNode.location}</p>}
+              {(selectedNode?.school || selectedNode?.location) && (
+                <p><strong>School:</strong> {selectedNode.school || selectedNode.location}</p>
+              )}
+              {selectedNode?.role && <p><strong>Role:</strong> {selectedNode.role}</p>}
               {selectedNode?.email && <p><strong>Email:</strong>{" "}
                 <a href={`mailto:${selectedNode.email}`}>
                 {selectedNode.email}
                 </a>
               </p>}
-              {selectedNode?.website && <p><strong>LinkedIn:</strong>{" "}
-                <a href={selectedNode.website} target="_blank" rel="noopener noreferrer">
-                {selectedNode.website.length > 30
-                  ? `${selectedNode.website.substring(0, 30)}...`
-                : selectedNode.website}
-                </a>
-              </p>}
+              {selectedNode?.website && (
+                <p><strong>LinkedIn:</strong>{" "}
+                  <a
+                    href={normalizeUrl(selectedNode.website)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    {linkLabel(normalizeUrl(selectedNode.website))}
+                  </a>
+                </p>
+              )}
+              {parseExtraLinks(selectedNode?.links, selectedNode?.website).length > 0 && (
+                <div>
+                  <p><strong>Links:</strong></p>
+                  <ul style={{ marginTop: 0, paddingLeft: "20px" }}>
+                    {parseExtraLinks(selectedNode?.links, selectedNode?.website).map((url) => (
+                      <li key={url}>
+                        <a href={url} target="_blank" rel="noopener noreferrer">
+                          {linkLabel(url)}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </>
           );
         }
@@ -3297,6 +3703,9 @@ return (
       
 
     </div>
+  )}
+
+  </>
   )}
 
   </div>

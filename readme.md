@@ -2,16 +2,20 @@
 
 Live networking graph for in-person events: React + Neo4j Aura + [react-force-graph](https://github.com/vasturiano/react-force-graph).
 
-This repo is a **GitHub template**. Use it to spin up a new event network with its own Aura instance and GitHub Pages site, without the recommendation engine.
+This repo is a **GitHub template**. Use it to spin up a new event network with its own Aura instance and GitHub Pages site.
 
 Live site: [https://awuchen.github.io/DemoNet](https://awuchen.github.io/DemoNet)
 
 ## What is included
 
-- NFC / URL card tap: first tap of your own card registers the phone (`Yes, this is me`)
-- Later taps of someone else's card create a `CONNECTED_TO` relationship
-- Force-directed graph, node profiles (name, role/company, LinkedIn, email)
-- Timeline view and natural-language search
+- NFC / URL card tap with onboarding: claim your card or register as someone else, then connect
+- `CONNECTED_TO` relationships with `createdAt` for timeline playback
+- Force-directed graph; profiles use **school**, **role**, **email**, **LinkedIn**, and extra **links**
+- **Connections** view (default when a phone owner is set): people you met plus follow-up suggestions
+- **Timeline** mode: client-side playback with pinned layout (no force-layout springing or playback flicker)
+- Natural-language search and optional research export CSV (`scripts/export_participant_connections.py`)
+
+See `react-graph-viz/TIMELINE_README.md` for timeline behavior notes.
 
 ## Create a new event from this template
 
@@ -20,13 +24,14 @@ Live site: [https://awuchen.github.io/DemoNet](https://awuchen.github.io/DemoNet
 3. Update:
    - `react-graph-viz/src/neo4jConfig.js`
    - `Cred/` (replace the sample Aura file)
-   - `react-graph-viz/src/appConfig.js` (`APP_NAME`, `BASE_PATH`)
+   - `react-graph-viz/src/appConfig.js` (`APP_NAME`, `BASE_PATH`, `PHONE_OWNER_KEY`)
    - `react-graph-viz/package.json` (`homepage` and `deploy` repo URL)
    - `react-graph-viz/public/index.html` and `manifest.json` titles
 4. `cd react-graph-viz && npm install && npm run deploy`
 5. In the new repo: **Settings → Pages** → source `gh-pages`.
 6. Optionally import guests: `python3 scripts/import_guests.py guests.csv`
-7. Copy Aura credentials into GitHub Actions secrets (`NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE`) and enable **Neo4j Keep-Alive**.
+7. After the event, export participant data: `python3 scripts/export_participant_connections.py`
+8. Copy Aura credentials into GitHub Actions secrets (`NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE`) and enable **Neo4j Keep-Alive**.
 
 ## Neo4j
 
